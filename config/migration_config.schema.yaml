@@ -1,0 +1,111 @@
+schema_version: "1.0"
+
+source:
+  engine:
+    type: string
+    enum: [postgresql, mysql, mongodb, mssql]
+  connection:
+    host: { type: string }
+    port: { type: integer }
+    database: { type: string }
+    username: { type: string }
+    password_secret: { type: string }
+    ssl: { type: boolean, default: true }
+    ssl_ca_cert: { type: string, optional: true }
+
+target:
+  engine:
+    type: string
+    enum: [postgresql, mysql, mongodb, mssql, cosmos_mongo]
+  connection:
+    host: { type: string }
+    port: { type: integer }
+    database: { type: string }
+    username: { type: string }
+    password_secret: { type: string }
+    ssl: { type: boolean, default: true }
+    ssl_ca_cert: { type: string, optional: true }
+
+migration:
+  mode:
+    type: string
+    enum: [full, cdc-incremental, cdc-continuous]
+    default: full
+  batch_size:
+    type: integer
+    default: 1000
+    minimum: 1
+  field_mappings:
+    type: array
+    items:
+      type: object
+      properties:
+        source_field: { type: string }
+        target_field: { type: string }
+        exclude: { type: boolean, default: false }
+  max_document_size_mb:
+    type: number
+    default: 2.0
+
+retry:
+  max_retries:
+    type: integer
+    default: 3
+  base_delay_seconds:
+    type: number
+    default: 1.0
+  max_delay_seconds:
+    type: number
+    default: 30.0
+  circuit_breaker_max_failures:
+    type: integer
+    default: 5
+  circuit_breaker_reset_timeout_seconds:
+    type: number
+    default: 60.0
+
+secrets:
+  provider:
+    type: string
+    enum: [env, aws_secrets_manager, gcp_secret_manager, hashicorp_vault, local_encrypted_file, azure_keyvault]
+    default: env
+  aws_secrets_manager:
+    region: { type: string, optional: true }
+  gcp_secret_manager:
+    project_id: { type: string, optional: true }
+  hashicorp_vault:
+    url: { type: string }
+    token: { type: string }
+    mount_point: { type: string, default: secret }
+  local_encrypted_file:
+    file: { type: string, default: secrets.enc }
+    key_source: { type: string, enum: [env, keyring], default: env }
+    key_env_var: { type: string, default: MIGRATION_SECRETS_KEY }
+    keyring_service: { type: string, default: migration-platform/secrets-key }
+    auto_create: { type: boolean, default: false }
+  azure_keyvault:
+    url: { type: string, optional: true }
+    credential_secret_name: { type: string, optional: true }
+
+alerting:
+  notifier:
+    type: string
+    enum: [webhook, slack, teams, email, none]
+    default: none
+  webhook_url: { type: string, optional: true }
+
+validation:
+  mode:
+    type: string
+    enum: [count, checksum, full]
+    default: count
+  sample_size:
+    type: integer
+    default: 1000
+
+logging:
+  level:
+    type: string
+    enum: [DEBUG, INFO, WARNING, ERROR]
+    default: INFO
+  file: { type: string, optional: true }

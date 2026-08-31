@@ -1,0 +1,78 @@
+# ============================================================
+#  Migration Platform - Real Config File
+#  Mode: PostgreSQL to PostgreSQL (cdc-incremental)
+#
+#  HOW TO USE:
+#  1. Fill in your actual host, database, username below
+#  2. Set your password env vars in PowerShell:
+#       $env:SECRET_source_db_pass = "your_source_password"
+#       $env:SECRET_target_db_pass = "your_target_password"
+#  3. Run:
+#       python -m migration_platform --config config\my_config.yaml --mode cdc-incremental
+# ============================================================
+
+# SOURCE DATABASE (where data comes FROM)
+source:
+  engine: postgresql
+  connection:
+    host: localhost
+    port: 5432
+    database: shop_db
+    username: postgres
+    password_secret: source_db_pass
+    ssl: false
+
+# TARGET DATABASE (where data goes TO)
+target:
+  engine: postgresql
+  connection:
+    host: pgsql-flex-hybrid-01.postgres.database.azure.com
+    port: 5432
+    database: shop_db
+    username: rootuser
+    password_secret: target_db_pass
+    ssl: true
+    keepalives_idle: 30
+
+# MIGRATION SETTINGS
+migration:
+  mode: cdc-incremental
+  batch_size: 1000
+  # field_mappings:
+  #   - source_field: old_column_name
+  #     target_field: new_column_name
+  #   - source_field: sensitive_column
+  #     exclude: true
+
+# CDC SETTINGS
+# IMPORTANT: Source PostgreSQL must have wal_level = logical
+# Check with: SHOW wal_level;
+# To fix: see instructions below in this file
+cdc:
+  poll_interval: 10
+
+# RETRY / RESILIENCE
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+  circuit_breaker_max_failures: 5
+  circuit_breaker_reset_timeout_seconds: 60.0
+
+# SECRETS PROVIDER
+secrets:
+  provider: env
+
+# ALERTING (optional)
+alerting:
+  notifier: none
+
+# VALIDATION
+validation:
+  mode: count
+  sample_size: 1000
+
+# LOGGING
+logging:
+  level: INFO
+  # file: migration.log

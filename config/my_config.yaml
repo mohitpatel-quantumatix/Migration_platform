@@ -17,7 +17,7 @@ source:
   connection:
     host: localhost
     port: 5432
-    database: shop_db
+    database: eds_db1
     username: postgres
     password_secret: source_db_pass
     ssl: false
@@ -26,10 +26,10 @@ source:
 target:
   engine: postgresql
   connection:
-    host: pgsql-flex-hybrid-01.postgres.database.azure.com
+    host: dmt-postgre-test.postgres.database.azure.com
     port: 5432
-    database: shop_db
-    username: rootuser
+    database: eds_db
+    username: dmt_user
     password_secret: target_db_pass
     ssl: true
     keepalives_idle: 30

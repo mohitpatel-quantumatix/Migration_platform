@@ -109,7 +109,9 @@ def main():
         raise SystemExit(f"Unknown target engine: {target_type!r}. Available: {list(TARGET_CONNECTORS)}")
 
     source = instantiate_connector(SOURCE_CONNECTORS[source_type], source_cfg.get("connection", {}))
-    target = instantiate_connector(TARGET_CONNECTORS[target_type], target_cfg.get("connection", {}))
+    target_connection = dict(target_cfg.get("connection", {}))
+    target_connection["source_engine"] = source_type
+    target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)
 
     # ---- Audit log to file (suppress stdout noise when rich is active) ----
     use_live_ui = not args.no_live_ui

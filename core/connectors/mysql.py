@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+import json
+from pathlib import Path
 
 from core.connectors.base import (
     SourceConnector,
@@ -12,6 +14,7 @@ from core.connectors.base import (
     UpsertResult,
     ApplyResult,
     ChangeEvent,
+    UnmappedTypeError,
     validate_identifier,
 )
 from core.driver_installer import ensure_driver
@@ -37,6 +40,8 @@ class MySQLSourceConnector(SourceConnector):
             "password": self._config.get("password", ""),
             "ssl_disabled": not self._config.get("ssl", True),
         }
+
+        
 
         self._conn = mysql.connector.connect(**conn_kwargs)
         audit_log(phase="connect", status="success", details={"engine": "mysql", "role": "source"})
@@ -73,35 +78,44 @@ class MySQLSourceConnector(SourceConnector):
         columns: list[Column] = []
         primary_key: list[str] = []
 
-        with self._conn.cursor() as cur:
+        # Get columns
+        with self._conn.cursor(buffered=True) as cur:
             cur.execute(
-                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH "
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH "
                 "FROM INFORMATION_SCHEMA.COLUMNS "
                 "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
                 "ORDER BY ORDINAL_POSITION",
                 (self._config["database"], object_name),
             )
+
             for row in cur.fetchall():
-                col_name, data_type, nullable, max_len = row
+                col_name, column_type, nullable, max_len = row
                 columns.append(
                     Column(
                         name=col_name,
-                        source_type=data_type,
+                        source_type=column_type,
                         target_type=None,
                         nullable=(nullable == "YES"),
                         size=max_len,
                     )
                 )
 
+        # Get primary key separately
+        with self._conn.cursor(buffered=True) as cur:
             cur.execute(
                 "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
                 "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
                 "AND CONSTRAINT_NAME = 'PRIMARY'",
                 (self._config["database"], object_name),
             )
+
             primary_key = [row[0] for row in cur.fetchall()]
 
-        return Schema(name=object_name, columns=columns, primary_key=primary_key)
+        return Schema(
+            name=object_name,
+            columns=columns,
+            primary_key=primary_key,
+        )
 
 
 class MySQLTargetConnector(TargetConnector):
@@ -148,7 +162,19 @@ class MySQLTargetConnector(TargetConnector):
 
             col_defs = []
             for col in schema.columns:
-                col_type = col.target_type or col.source_type
+                if col.target_type is None:
+                    if self._config.get("source_engine") == "mysql":
+                        col_type = col.source_type
+                    else:
+                        raise UnmappedTypeError(
+                            table=schema.name,
+                            column=col.name,
+                            source_type=col.source_type,
+                            source_engine=self._config.get("source_engine"),
+                            target_engine="mysql",
+                        )
+                else:
+                    col_type = col.target_type
                 null_str = "NULL" if col.nullable else "NOT NULL"
                 col_defs.append(f"{col.name} {col_type} {null_str}")
 
@@ -233,8 +259,25 @@ class MySQLCDCEngine(CDCEngine):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
         self._conn: Any = None
+
         self._last_binlog_file: str | None = None
         self._last_binlog_pos: int | None = None
+
+        # Persistent CDC checkpoint
+        self._checkpoint_dir = Path("state") / "cdc"
+        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = (
+            f"{self._config['host']}_"
+            f"{self._config.get('port', 3306)}_"
+            f"{self._config['database']}"
+        ).replace(":", "_").replace("/", "_").replace("\\", "_")
+
+        self._checkpoint_path = (
+            self._checkpoint_dir / f"mysql_{safe_name}.json"
+        )
+
+        self._load_checkpoint()
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def connect(self) -> None:
@@ -250,18 +293,56 @@ class MySQLCDCEngine(CDCEngine):
         }
 
         self._conn = mysql.connector.connect(**conn_kwargs)
+    def _load_checkpoint(self) -> None:
+        if not self._checkpoint_path.exists():
+            return
+
+        try:
+            with self._checkpoint_path.open("r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            self._last_binlog_file = state.get("binlog_file")
+            self._last_binlog_pos = state.get("binlog_pos")
+
+            audit_log(
+                phase="cdc_checkpoint",
+                status="loaded",
+                details={
+                    "binlog_file": self._last_binlog_file,
+                    "binlog_pos": self._last_binlog_pos,
+                },
+            )
+
+        except Exception as exc:
+            audit_log(
+                phase="cdc_checkpoint",
+                status="load_failed",
+                details={"error": str(exc)},
+            )
 
     def start(self) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute("SHOW MASTER STATUS")
-            row = cur.fetchone()
-            if row:
-                self._last_binlog_file = row[0]
-                self._last_binlog_pos = row[1]
-        audit_log(phase="cdc_start", status="success", details={"engine": "mysql"})
+    # Only initialize a new CDC position if no checkpoint exists.
+    # Never overwrite a persisted checkpoint.
+        if self._last_binlog_file is None:
+            with self._conn.cursor() as cur:
+                cur.execute("SHOW BINARY LOG STATUS")
+                row = cur.fetchone()
+                if row:
+                    self._last_binlog_file = row[0]
+                    self._last_binlog_pos = row[1]
+
+        audit_log(
+            phase="cdc_start",
+            status="success",
+            details={
+                "engine": "mysql",
+                "binlog_file": self._last_binlog_file,
+                "binlog_pos": self._last_binlog_pos,
+            },
+        )
 
     def poll_changes(self) -> list[ChangeEvent]:
-        from pymysqlreplication import BinlogStreamReader
+        from pymysqlreplication import BinLogStreamReader
         from pymysqlreplication.row_event import (
             WriteRowsEvent,
             UpdateRowsEvent,
@@ -273,19 +354,26 @@ class MySQLCDCEngine(CDCEngine):
             "port": self._config.get("port", 3306),
             "user": self._config["username"],
             "passwd": self._config.get("password", ""),
-            "ssl": self._config.get("ssl", True),
             "connect_timeout": 5,
             "read_timeout": 5,
         }
 
-        stream = BinlogStreamReader(
+        if self._config.get("ssl", False):
+            conn_kwargs["ssl"] = {}
+
+        stream = BinLogStreamReader(
             connection_settings=conn_kwargs,
             server_id=self._config.get("server_id", 100),
             blocking=False,
             resume_stream=self._last_binlog_file is not None,
             log_file=self._last_binlog_file,
             log_pos=self._last_binlog_pos or 4,
-            only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent],
+            only_events=[
+                WriteRowsEvent,
+                UpdateRowsEvent,
+                DeleteRowsEvent,
+            ],
+            only_schemas=[self._config["database"]],
         )
 
         events: list[ChangeEvent] = []
@@ -341,41 +429,95 @@ class MySQLCDCEngine(CDCEngine):
 
         return events
 
-    def apply(self, events: list[ChangeEvent], target: TargetConnector) -> ApplyResult:
+    def apply(
+        self,
+        events: list[ChangeEvent],
+        target: TargetConnector,
+    ) -> ApplyResult:
         result = ApplyResult()
+
         if not events:
             return result
 
         for event in events:
             try:
-                if event.operation == "insert":
-                    target.upsert_batch(event.object_name, iter([event.document]), event.schema)
-                elif event.operation == "update":
-                    target.upsert_batch(event.object_name, iter([event.document]), event.schema)
+                if event.operation in ("insert", "update"):
+                    apply_result = target.upsert_batch(
+                        event.object_name,
+                        iter([event.document]),
+                        event.schema,
+                    )
+
+                    if apply_result.failure_count > 0:
+                        result.failure_count += apply_result.failure_count
+                        result.errors.extend(apply_result.errors)
+                        continue
+
+                    result.success_count += apply_result.success_count
+
                 elif event.operation == "delete":
-                    target.delete(event.object_name, event.document, event.schema)
-                result.success_count += 1
+                    target.delete(
+                        event.object_name,
+                        event.document,
+                        event.schema,
+                    )
+                    result.success_count += 1
+
             except Exception as exc:
                 result.failure_count += 1
                 result.errors.append(str(exc))
 
-        if result.failure_count == 0:
+        if result.failure_count == 0 and result.success_count > 0:
             result.last_checkpoint = events[-1].watermark
-            audit_log(phase="cdc_apply", status="success", details={"applied": result.success_count})
+
+            audit_log(
+                phase="cdc_apply",
+                status="success",
+                details={
+                    "applied": result.success_count,
+                },
+            )
         else:
-            audit_log(phase="cdc_apply", status="partial_failure", details={"success": result.success_count, "failure": result.failure_count})
+            audit_log(
+                phase="cdc_apply",
+                status="partial_failure",
+                details={
+                    "success": result.success_count,
+                    "failure": result.failure_count,
+                },
+            )
 
         return result
 
+    
     def checkpoint(self, result: ApplyResult) -> None:
         if result.last_checkpoint is None:
             return
 
         watermark = result.last_checkpoint
+
         if isinstance(watermark, dict):
             self._last_binlog_file = watermark.get("file")
             self._last_binlog_pos = watermark.get("pos")
         else:
             self._last_binlog_file = str(watermark)
             self._last_binlog_pos = None
-        audit_log(phase="cdc_checkpoint", status="advanced", details={"binlog_file": self._last_binlog_file, "binlog_pos": self._last_binlog_pos})
+
+        with self._checkpoint_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "binlog_file": self._last_binlog_file,
+                    "binlog_pos": self._last_binlog_pos,
+                },
+                f,
+                indent=2,
+            )
+
+        audit_log(
+            phase="cdc_checkpoint",
+            status="advanced",
+            details={
+                "binlog_file": self._last_binlog_file,
+                "binlog_pos": self._last_binlog_pos,
+            },
+        )

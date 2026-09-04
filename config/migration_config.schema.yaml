@@ -35,6 +35,9 @@ migration:
     type: integer
     default: 1000
     minimum: 1
+  stop_on_error:
+    type: boolean
+    default: false
   field_mappings:
     type: array
     items:
@@ -46,6 +49,15 @@ migration:
   max_document_size_mb:
     type: number
     default: 2.0
+
+cdc:
+  poll_interval:
+    type: integer
+    default: 10
+    minimum: 1
+  allow_source_service_restart:
+    type: boolean
+    default: false
 
 retry:
   max_retries:

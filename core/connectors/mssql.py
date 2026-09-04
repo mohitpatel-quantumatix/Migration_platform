@@ -12,6 +12,7 @@ from core.connectors.base import (
     UpsertResult,
     ApplyResult,
     ChangeEvent,
+    UnmappedTypeError,
     validate_identifier,
 )
 from core.driver_installer import ensure_driver
@@ -154,7 +155,19 @@ class MSSQLTargetConnector(TargetConnector):
 
             col_defs = []
             for col in schema.columns:
-                col_type = col.target_type or col.source_type
+                if col.target_type is None:
+                    if self._config.get("source_engine") == "mssql":
+                        col_type = col.source_type
+                    else:
+                        raise UnmappedTypeError(
+                            table=schema.name,
+                            column=col.name,
+                            source_type=col.source_type,
+                            source_engine=self._config.get("source_engine"),
+                            target_engine="mssql",
+                        )
+                else:
+                    col_type = col.target_type
                 null_str = "NULL" if col.nullable else "NOT NULL"
                 col_defs.append(f"{col.name} {col_type} {null_str}")
 
@@ -195,7 +208,7 @@ class MSSQLTargetConnector(TargetConnector):
                 f"USING (SELECT {placeholders}) AS source ({col_names}) "
                 f"ON {on_clause} "
                 f"WHEN MATCHED THEN UPDATE SET {update_set} "
-                f"WHEN NOT MATCHED THEN INSERT ({col_names}) VALUES (source.{col_names})"
+                f"WHEN NOT MATCHED THEN INSERT ({col_names}) VALUES (source.{col_names});"
             )
 
             try:

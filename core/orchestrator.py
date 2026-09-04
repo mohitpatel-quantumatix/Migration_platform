@@ -41,6 +41,10 @@ class MigrationOrchestrator:
         self._assessment_gen = AssessmentReportGenerator(self._registry)
         self._batch_size = config.get("migration", {}).get("batch_size", 1000)
         self._mode = config.get("migration", {}).get("mode", "full")
+        self._stop_on_error = config.get("migration", {}).get("stop_on_error", False)
+        self._allow_source_service_restart = config.get("cdc", {}).get(
+            "allow_source_service_restart", False
+        )
         self._field_mappings = config.get("migration", {}).get("field_mappings", [])
         self._notifier = create_notifier(config.get("alerting", {}))
         self._secret_resolver = create_secret_provider(config)
@@ -66,6 +70,24 @@ class MigrationOrchestrator:
             except Exception:
                 pass
         return total
+
+    def _record_object_failure(
+        self,
+        failures: list[dict[str, str]],
+        all_errors: list[str],
+        phase: str,
+        object_name: str,
+        error: Exception | str,
+    ) -> str:
+        message = f"{phase} failed for object {object_name!r}: {error}"
+        failures.append({"phase": phase, "object": object_name, "error": str(error)})
+        all_errors.append(message)
+        audit_log(
+            phase=phase,
+            status="error",
+            details={"object": object_name, "error": str(error)},
+        )
+        return message
 
     def run_full(self) -> dict[str, Any]:
         run_id = get_run_id()
@@ -176,12 +198,31 @@ class MigrationOrchestrator:
 
             # ---------- Phase 4: Create Tables ----------
             all_schemas: dict[str, Any] = {}
+            object_failures: list[dict[str, str]] = []
+            failed_objects: set[str] = set()
+            result["phases"]["object_failures"] = object_failures
             for obj_name in objects:
-                schema = self._source.get_schema(obj_name)
-                self._apply_field_mappings(schema)
-                self._target.create_object_if_missing(schema)
-                all_schemas[obj_name] = schema
-            result["phases"]["create_tables"] = "success"
+                try:
+                    schema = self._source.get_schema(obj_name)
+                    self._apply_field_mappings(schema)
+                    self._target.create_object_if_missing(schema)
+                    all_schemas[obj_name] = schema
+                except Exception as exc:
+                    failed_objects.add(obj_name)
+                    message = self._record_object_failure(
+                        object_failures, all_errors, "create_table", obj_name, exc
+                    )
+                    result["phases"][obj_name] = {
+                        "status": "creation_failed",
+                        "success": 0,
+                        "failure": 1,
+                        "errors": [message],
+                    }
+                    if self._stop_on_error:
+                        raise RuntimeError(message) from exc
+            result["phases"]["create_tables"] = (
+                "partial_success" if failed_objects else "success"
+            )
             self._update_status("create_tables", 16, all_errors)
 
             # ---------- Phase 4.5: Create Partition Children ----------
@@ -205,32 +246,54 @@ class MigrationOrchestrator:
             # ---------- Phase 5: Migrate Data ----------
             total_rows = self._estimate_total_rows(objects)
             processed_rows = 0
-            for idx, obj_name in enumerate(objects, start=1):
-                schema = all_schemas[obj_name]
-                count = self._source.get_object_count(obj_name)
-                rows = self._source.export_full(obj_name)
+            for idx, (obj_name, schema) in enumerate(all_schemas.items(), start=1):
                 upsert_result = UpsertResult()
-                for chunk in self._chunked(rows, self._batch_size):
-                    chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
-                    upsert_result.success_count += chunk_result.success_count
-                    upsert_result.failure_count += chunk_result.failure_count
-                    upsert_result.errors.extend(chunk_result.errors)
-                    upsert_result.failed_items.extend(chunk_result.failed_items)
-                    processed_rows += chunk_result.success_count
-                    if total_rows > 0:
-                        progress = min(55, int(15 + (processed_rows / total_rows) * 40))
-                    else:
-                        progress = 15 + int((idx / max(len(objects), 1)) * 40)
-                    self._update_status(
-                        f"data: {obj_name} ({idx}/{len(objects)})", progress, all_errors,
-                    )
+                count: int | None = None
+                try:
+                    count = self._source.get_object_count(obj_name)
+                    rows = self._source.export_full(obj_name)
+                    for chunk in self._chunked(rows, self._batch_size):
+                        chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
+                        upsert_result.success_count += chunk_result.success_count
+                        upsert_result.failure_count += chunk_result.failure_count
+                        upsert_result.errors.extend(chunk_result.errors)
+                        upsert_result.failed_items.extend(chunk_result.failed_items)
+                        processed_rows += chunk_result.success_count
+                        if total_rows > 0:
+                            progress = min(55, int(15 + (processed_rows / total_rows) * 40))
+                        else:
+                            progress = 15 + int((idx / max(len(objects), 1)) * 40)
+                        self._update_status(
+                            f"data: {obj_name} ({idx}/{len(all_schemas)})", progress, all_errors,
+                        )
+
+                    if upsert_result.failure_count:
+                        details = "; ".join(upsert_result.errors) or (
+                            f"target reported {upsert_result.failure_count} failed row(s)"
+                        )
+                        message = self._record_object_failure(
+                            object_failures, all_errors, "data_load", obj_name, details
+                        )
+                        failed_objects.add(obj_name)
+                        upsert_result.errors.append(message)
+                        if self._stop_on_error:
+                            raise RuntimeError(message)
+                except Exception as exc:
+                    if obj_name not in failed_objects:
+                        message = self._record_object_failure(
+                            object_failures, all_errors, "data_load", obj_name, exc
+                        )
+                        failed_objects.add(obj_name)
+                        upsert_result.errors.append(message)
+                    if self._stop_on_error:
+                        raise
+
                 result["phases"][obj_name] = {
-                    "source_rows": count,
+                    "source_rows": count or 0,
                     "success": upsert_result.success_count,
-                    "failure": upsert_result.failure_count,
+                    "failure": max(upsert_result.failure_count, int(obj_name in failed_objects)),
                     "errors": upsert_result.errors,
                 }
-                all_errors.extend(upsert_result.errors)
 
             # ---------- Phase 6+7+8: Indexes, FKs, Check Constraints ----------
             constraint_results: dict[str, str] = {}
@@ -372,9 +435,15 @@ class MigrationOrchestrator:
 
             # ---------- Phase 17: Validate ----------
             self._update_status("validation", 94, all_errors)
-            validation = self.validate()
+            validation_objects = [
+                obj_name for obj_name in all_schemas if obj_name not in failed_objects
+            ]
+            validation = self.validate(validation_objects)
             result["phases"]["validation"] = validation
-            result["status"] = validation.get("status", "unknown")
+            if failed_objects:
+                result["status"] = "partial_success" if validation_objects else "failed"
+            else:
+                result["status"] = validation.get("status", "unknown")
             self._update_status("completed", 100, all_errors)
 
         except Exception as exc:
@@ -413,7 +482,8 @@ class MigrationOrchestrator:
         Preflight check for CDC: ensure wal_level = logical on the source.
 
         If wal_level is already 'logical' (common on cloud PostgreSQL like Azure/AWS/GCP),
-        this is a no-op. If not, the method:
+        this is a no-op. If not, an explicit cdc.allow_source_service_restart
+        opt-in is required before the method:
           1. Reads postgresql.conf path from the database
           2. Patches/adds  wal_level = logical  in that file
           3. Restarts the PostgreSQL service (tries pg_ctl → net stop/start → systemctl)
@@ -436,6 +506,20 @@ class MigrationOrchestrator:
 
         audit_log(phase="preflight_cdc", status="wal_level_needs_fix",
                   details={"current": wal_level, "required": "logical"})
+
+        if not self._allow_source_service_restart:
+            audit_log(
+                phase="preflight_cdc",
+                status="restart_not_allowed",
+                details={"current": wal_level, "required": "logical"},
+            )
+            raise RuntimeError(
+                "PostgreSQL source requires wal_level = logical for CDC, which requires "
+                "a source-service restart. Automatic source-service restart is disabled. "
+                "Configure PostgreSQL for logical replication and restart it manually, or set "
+                "cdc.allow_source_service_restart=true only if you explicitly authorize "
+                "the Migration Platform to restart the source PostgreSQL service."
+            )
 
         # ── 2. Find postgresql.conf ───────────────────────────────────────────
         try:
@@ -924,10 +1008,10 @@ class MigrationOrchestrator:
         )
         return report
 
-    def validate(self) -> dict[str, Any]:
+    def validate(self, objects: list[str] | None = None) -> dict[str, Any]:
         validator = Validator(self._source, self._target)
         validation_mode = self._config.get("validation", {}).get("mode", "count")
-        source_objects = self._source.list_objects()
+        source_objects = objects if objects is not None else self._source.list_objects()
 
         results: dict[str, Any] = {
             "mode": validation_mode,

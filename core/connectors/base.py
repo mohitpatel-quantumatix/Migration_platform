@@ -14,6 +14,27 @@ IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _QUOTED_IDENTIFIER_RE = re.compile(r'^"([^"\x00]|"")*"$')
 
 
+class UnmappedTypeError(ValueError):
+    """Raised when a cross-engine column type has no target representation."""
+
+    def __init__(
+        self,
+        *,
+        table: str,
+        column: str,
+        source_type: str,
+        source_engine: str | None,
+        target_engine: str,
+    ) -> None:
+        source_label = source_engine or "unknown"
+        super().__init__(
+            "Unmapped cross-engine column type: "
+            f"table={table!r}, column={column!r}, source_type={source_type!r}, "
+            f"source_engine={source_label!r}, target_engine={target_engine!r}. "
+            "Configure a target type mapping before running the migration."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Column & Schema dataclasses
 # ---------------------------------------------------------------------------

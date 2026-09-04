@@ -1,14 +1,6 @@
 # ============================================================
 #  Migration Platform - Real Config File
 #  Mode: PostgreSQL to PostgreSQL (cdc-incremental)
-#
-#  HOW TO USE:
-#  1. Fill in your actual host, database, username below
-#  2. Set your password env vars in PowerShell:
-#       $env:SECRET_source_db_pass = "your_source_password"
-#       $env:SECRET_target_db_pass = "your_target_password"
-#  3. Run:
-#       python -m migration_platform --config config\my_config.yaml --mode cdc-incremental
 # ============================================================
 
 # SOURCE DATABASE (where data comes FROM)
@@ -24,15 +16,14 @@ source:
 
 # TARGET DATABASE (where data goes TO)
 target:
-  engine: postgresql
+  engine: cosmos_mongo
   connection:
-    host: dmt-postgre-test.postgres.database.azure.com
-    port: 5432
-    database: eds_db
-    username: dmt_user
+    host: dmt-cosmos-test1.mongocluster.cosmos.azure.com
+    port: 27017
+    database: eds_target_cosmos
+    username: dbuser9gybjr
     password_secret: target_db_pass
     ssl: true
-    keepalives_idle: 30
 
 # MIGRATION SETTINGS
 migration:
@@ -45,9 +36,6 @@ migration:
   #     exclude: true
 
 # CDC SETTINGS
-# IMPORTANT: Source PostgreSQL must have wal_level = logical
-# Check with: SHOW wal_level;
-# To fix: see instructions below in this file
 cdc:
   poll_interval: 10
 

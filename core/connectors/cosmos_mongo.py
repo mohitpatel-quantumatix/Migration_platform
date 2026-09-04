@@ -35,7 +35,6 @@ class CosmosMongoTargetConnector(TargetConnector):
         from pymongo import MongoClient
 
         host = self._config["host"]
-        port = self._config.get("port", 443)
         database = self._config["database"]
         username = self._config.get("username")
         password = self._config.get("password")
@@ -45,9 +44,10 @@ class CosmosMongoTargetConnector(TargetConnector):
 
         conn_kwargs: dict[str, Any] = {
             "host": host,
-            "port": port,
             "tls": ssl,
             "tlsAllowInvalidCertificates": False,
+            "retryWrites": True,
+            "serverSelectionTimeoutMS": 30000,
         }
 
         if username and password:
@@ -150,7 +150,6 @@ class CosmosMongoCDCEngine(CDCEngine):
         from pymongo import MongoClient
 
         host = self._config["host"]
-        port = self._config.get("port", 443)
         database = self._config["database"]
         username = self._config.get("username")
         password = self._config.get("password")
@@ -158,9 +157,10 @@ class CosmosMongoCDCEngine(CDCEngine):
 
         conn_kwargs: dict[str, Any] = {
             "host": host,
-            "port": port,
             "tls": ssl,
             "tlsAllowInvalidCertificates": False,
+            "retryWrites": True,
+            "serverSelectionTimeoutMS": 30000,
         }
 
         if username and password:
